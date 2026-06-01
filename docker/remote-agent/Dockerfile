@@ -16,6 +16,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bash build-essential ca-certificates curl git gnupg jq less openssh-client procps \
     python3 python3-pip python3-venv ripgrep sudo unzip xz-utils zip zsh \
   && rm -rf /var/lib/apt/lists/*
+# GitHub CLI (gh) so agents can open PRs (`gh pr create`). Not in Debian's repos,
+# so add GitHub's official apt source. gh authenticates to the GitHub API with a
+# token (env GH_TOKEN, or one-time `gh auth login` persisted under
+# ~/.config/gh on the /home/workspace volume) — it does NOT use the SSH key.
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+       -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+  && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+       > /etc/apt/sources.list.d/github-cli.list \
+  && apt-get update && apt-get install -y --no-install-recommends gh \
+  && rm -rf /var/lib/apt/lists/*
 RUN usermod -l workspace -d /home/workspace -m node \
   && groupmod -n workspace node \
   && echo "workspace ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/workspace \
@@ -54,7 +66,7 @@ ENV MC_WORKSPACE_ROOT=/workspace \
 EXPOSE 9333
 WORKDIR /workspace
 USER workspace
-RUN { claude --version; codex --version; cursor-agent --version; opencode --version; } || true
+RUN { claude --version; codex --version; cursor-agent --version; opencode --version; gh --version; } || true
 USER root
 COPY docker-entrypoint.sh /usr/local/bin/mc-entrypoint.sh
 RUN chmod +x /usr/local/bin/mc-entrypoint.sh
