@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { GitRpc } from "../git-rpc";
+import { GitRpc, deriveSshFallbackRemote } from "../git-rpc";
 
 let workspace: string;
 let repo: string;
@@ -132,6 +132,63 @@ describe("GitRpc.clone", () => {
     ).rejects.toThrow(/git clone failed/);
   }, 20_000);
 
+});
+
+describe("deriveSshFallbackRemote", () => {
+  let keyDir: string;
+  let emptyDir: string;
+  const AUTH_ERR = "fatal: could not read Username for 'https://github.com': terminal prompts disabled";
+
+  beforeAll(() => {
+    keyDir = fs.mkdtempSync(path.join(os.tmpdir(), "mc-ssh-key-"));
+    fs.writeFileSync(path.join(keyDir, "id_ed25519"), "PRIVATE KEY\n", { mode: 0o600 });
+    fs.writeFileSync(path.join(keyDir, "id_ed25519.pub"), "ssh-ed25519 AAAA\n");
+    fs.writeFileSync(path.join(keyDir, "known_hosts"), "github.com ssh-ed25519 AAAA\n");
+    emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), "mc-ssh-nokey-"));
+    fs.writeFileSync(path.join(emptyDir, "known_hosts"), "github.com ssh-ed25519 AAAA\n");
+  });
+
+  afterAll(() => {
+    fs.rmSync(keyDir, { recursive: true, force: true });
+    fs.rmSync(emptyDir, { recursive: true, force: true });
+  });
+
+  it("maps an HTTPS GitHub auth failure to the SSH remote when a key exists", () => {
+    expect(deriveSshFallbackRemote("https://github.com/x-lunofi-studio/lunofi-newsletter", AUTH_ERR, keyDir)).toBe(
+      "git@github.com:x-lunofi-studio/lunofi-newsletter",
+    );
+  });
+
+  it("preserves a .git suffix and works for self-hosted GitLab subgroups", () => {
+    expect(deriveSshFallbackRemote("https://github.com/owner/repo.git", AUTH_ERR, keyDir)).toBe(
+      "git@github.com:owner/repo.git",
+    );
+    expect(deriveSshFallbackRemote("https://gitlab.example.com/group/sub/repo", AUTH_ERR, keyDir)).toBe(
+      "git@gitlab.example.com:group/sub/repo",
+    );
+  });
+
+  it("does NOT fall back for a non-auth failure (surfaces the real error)", () => {
+    const notFound = "remote: Repository not found.\nfatal: repository 'https://github.com/x/y' not found";
+    expect(deriveSshFallbackRemote("https://github.com/x/y", notFound, keyDir)).toBeNull();
+  });
+
+  it("does NOT fall back when no SSH private key is present", () => {
+    expect(deriveSshFallbackRemote("https://github.com/owner/repo", AUTH_ERR, emptyDir)).toBeNull();
+  });
+
+  it("does NOT fall back for SSH or already-credentialed remotes", () => {
+    expect(deriveSshFallbackRemote("git@github.com:owner/repo.git", AUTH_ERR, keyDir)).toBeNull();
+    expect(deriveSshFallbackRemote("https://user:pw@github.com/owner/repo", AUTH_ERR, keyDir)).toBeNull();
+  });
+
+  it("does NOT fall back for a host-root URL with no owner/repo path", () => {
+    expect(deriveSshFallbackRemote("https://github.com/", AUTH_ERR, keyDir)).toBeNull();
+    expect(deriveSshFallbackRemote("https://github.com/onlyowner", AUTH_ERR, keyDir)).toBeNull();
+  });
+});
+
+describe("GitRpc.clone (credential scrubbing)", () => {
   it("scrubs embedded credentials from a clone failure message", async () => {
     // Unreachable host:port so git fails fast (GIT_TERMINAL_PROMPT=0); the URL it
     // echoes in stderr must not carry the password back to the caller/UI.

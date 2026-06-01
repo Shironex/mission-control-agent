@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
   parsePorcelainZ,
   changedFileCount,
@@ -29,6 +31,81 @@ const SSH_SCP_REMOTE = new RegExp(
 
 type RunGitResult = { stdout: string; stderr: string; code: number };
 type RunGitOptions = { timeoutMs?: number; extraEnv?: Record<string, string> };
+
+// Transport/auth env shared by the clone attempt and the SSH fallback retry.
+// `--` separates options from the remote; GIT_ALLOW_PROTOCOL pins transports;
+// GIT_TERMINAL_PROMPT=0 makes auth failures fail fast instead of blocking the RPC
+// on an (invisible, in-container) username/password prompt.
+const CLONE_EXTRA_ENV: Record<string, string> = {
+  GIT_ALLOW_PROTOCOL: "http:https:ssh",
+  GIT_PROTOCOL_FROM_USER: "0",
+  GIT_TERMINAL_PROMPT: "0",
+  GIT_SSH_COMMAND: "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
+};
+
+// git stderr markers that mean an HTTPS remote needs credentials we don't have.
+// Narrow on purpose: a "repository not found" or network error must NOT trigger
+// the SSH fallback — only a genuine missing-credentials failure should.
+const HTTPS_AUTH_FAILURE_RE =
+  /could not read Username|terminal prompts disabled|Authentication failed|Invalid username or password|fatal: Authentication/i;
+
+// Names under ~/.ssh that are not usable private keys.
+const NON_PRIVATE_KEY_SSH_FILES = new Set([
+  "known_hosts",
+  "known_hosts2",
+  "config",
+  "authorized_keys",
+  "authorized_keys2",
+]);
+
+function hasSshPrivateKey(sshDir: string): boolean {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(sshDir);
+  } catch {
+    return false;
+  }
+  return entries.some((name) => !name.endsWith(".pub") && !NON_PRIVATE_KEY_SSH_FILES.has(name));
+}
+
+/**
+ * Mission Control derives the clone remote from the selected repo's `origin`,
+ * which is commonly an HTTPS URL, while a sandbox is typically provisioned with
+ * SSH auth only (a generated/copied key under ~/.ssh). Git never uses an SSH key
+ * for an `https://` remote, so a private repo fails with
+ * "could not read Username for 'https://github.com': terminal prompts disabled".
+ *
+ * When that specific auth failure happens AND a private key is present, derive
+ * the equivalent SSH remote (`git@host:owner/repo.git`) so the clone can be
+ * retried over SSH with the key the user already set up. Returns null when a
+ * fallback doesn't apply — non-HTTP(S) remote, a non-auth failure (e.g.
+ * repo-not-found: surface the real error), a URL that already carried
+ * credentials, no key on disk, or a host/path that can't form a valid SSH
+ * remote. Public HTTPS repos never reach here because they don't fail auth.
+ */
+export function deriveSshFallbackRemote(
+  remote: string,
+  stderr: string,
+  sshDir: string,
+): string | null {
+  if (!HTTPS_AUTH_FAILURE_RE.test(stderr)) return null;
+  let u: URL;
+  try {
+    u = new URL(remote);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+  // If creds were supplied and still failed, don't silently switch transport —
+  // that would mask a real authentication problem.
+  if (u.username || u.password) return null;
+  const host = u.hostname;
+  const repoPath = u.pathname.replace(/^\/+/, "").replace(/\/+$/, "");
+  if (!SSH_HOST.test(host) || !SSH_REPO_PATH.test(repoPath)) return null;
+  if (!hasSshPrivateKey(sshDir)) return null;
+  const ssh = `git@${host}:${repoPath}`;
+  return SSH_SCP_REMOTE.test(ssh) ? ssh : null;
+}
 
 /**
  * Spawn git directly (no shell) with a MINIMAL, allowlisted environment — never
@@ -141,7 +218,12 @@ export class GitRpc {
   /** Slugs with a clone in flight — guards the existsSync TOCTOU under retries. */
   private readonly cloning = new Set<string>();
 
-  constructor(private readonly workspaceRoot: string) {}
+  constructor(
+    private readonly workspaceRoot: string,
+    // Where provisioned SSH keys live (must match SshRpc's dir). Used to decide
+    // whether an HTTPS auth failure can fall back to an SSH clone.
+    private readonly sshDir: string = path.join(os.homedir(), ".ssh"),
+  ) {}
 
   private repoCwd(repo: string): string {
     const abs = resolveInsideWorkspace(this.workspaceRoot, repo);
@@ -243,24 +325,42 @@ export class GitRpc {
     const startedAt = Date.now();
     log("info", "git.clone.start", { slug, remote: redactRemote(remote) });
     try {
-      // `--` separates options from the remote; GIT_ALLOW_PROTOCOL pins transports;
-      // GIT_TERMINAL_PROMPT=0 makes auth failures fail fast instead of blocking the
-      // RPC on an (invisible, in-container) username/password prompt.
       const r = await runGit(this.workspaceRoot, ["clone", "--", remote, slug], {
         timeoutMs: CLONE_TIMEOUT_MS,
-        extraEnv: {
-          GIT_ALLOW_PROTOCOL: "http:https:ssh",
-          GIT_PROTOCOL_FROM_USER: "0",
-          GIT_TERMINAL_PROMPT: "0",
-          GIT_SSH_COMMAND: "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
-        },
+        extraEnv: CLONE_EXTRA_ENV,
       });
-      if (r.code !== 0) {
-        log("error", "git.clone.fail", { slug, durationMs: Date.now() - startedAt });
-        throw new Error(`git clone failed: ${scrubCloneError(r.stderr, remote) || `exit ${r.code}`}`);
+      if (r.code === 0) {
+        log("info", "git.clone.ok", { slug, durationMs: Date.now() - startedAt });
+        return { slug, path: dest };
       }
-      log("info", "git.clone.ok", { slug, durationMs: Date.now() - startedAt });
-      return { slug, path: dest };
+
+      // The remote (commonly Mission Control's HTTPS origin) failed for lack of
+      // credentials, but an SSH key is provisioned — retry once over SSH so the
+      // key is actually used. Non-auth failures return null here and surface as-is.
+      const sshRemote = deriveSshFallbackRemote(remote, r.stderr, this.sshDir);
+      if (sshRemote) {
+        // git may leave a partial dir from the failed attempt; dest was verified
+        // empty/absent up front, so clearing it before the retry is safe.
+        try {
+          fs.rmSync(dest, { recursive: true, force: true });
+        } catch {
+          /* best effort */
+        }
+        log("info", "git.clone.ssh_fallback", { slug, remote: redactRemote(sshRemote) });
+        const r2 = await runGit(this.workspaceRoot, ["clone", "--", sshRemote, slug], {
+          timeoutMs: CLONE_TIMEOUT_MS,
+          extraEnv: CLONE_EXTRA_ENV,
+        });
+        if (r2.code === 0) {
+          log("info", "git.clone.ok", { slug, durationMs: Date.now() - startedAt, viaSshFallback: true });
+          return { slug, path: dest };
+        }
+        log("error", "git.clone.fail", { slug, durationMs: Date.now() - startedAt, viaSshFallback: true });
+        throw new Error(`git clone failed: ${scrubCloneError(r2.stderr, sshRemote) || `exit ${r2.code}`}`);
+      }
+
+      log("error", "git.clone.fail", { slug, durationMs: Date.now() - startedAt });
+      throw new Error(`git clone failed: ${scrubCloneError(r.stderr, remote) || `exit ${r.code}`}`);
     } finally {
       this.cloning.delete(slug);
     }
