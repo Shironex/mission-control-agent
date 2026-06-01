@@ -23,6 +23,13 @@ RUN usermod -l workspace -d /home/workspace -m node \
 RUN corepack enable \
   && corepack prepare pnpm@11.1.2 --activate \
   && npm install -g @openai/codex@latest @anthropic-ai/claude-code@latest opencode-ai@latest
+# The root `npm install -g` above (opencode) creates /home/workspace/.local owned
+# by root. The cursor-agent installer below runs as `workspace` and writes under
+# ~/.local/share/cursor-agent — pre-create and chown ~/.local first, otherwise its
+# mkdir fails with EACCES, the installer ignores the error, and the tar step then
+# fails ("Cannot open ... No such file or directory" / curl 23).
+RUN mkdir -p /home/workspace/.local/bin /home/workspace/.local/share \
+  && chown -R workspace:workspace /home/workspace/.local
 USER workspace
 RUN for i in 1 2 3; do \
       curl https://cursor.com/install -fsS | bash && break; \
