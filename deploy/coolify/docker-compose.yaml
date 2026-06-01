@@ -1,0 +1,67 @@
+# Coolify deploy bundle for the Mission Control remote agent — PRIVATE / Tailscale.
+#
+# This variant does NOT expose a public domain and does NOT use Coolify's Traefik
+# proxy. The agent is published only on the host loopback (127.0.0.1:9333); you
+# reach it over your tailnet with `tailscale serve` on the Coolify host. Coolify
+# still builds the image, runs the container, and manages the persistent volume.
+#
+# Use the "Docker Compose" build pack with:
+#   Repository           : https://github.com/Shironex/mission-control-agent
+#   Docker Compose Path  : /deploy/coolify/docker-compose.yaml
+#
+# Do NOT add a `networks:` block — Coolify creates an isolated network per stack.
+# A custom network puts the container on two networks and causes intermittent 504s.
+
+services:
+  mission-control-agent:
+    build:
+      # Build context must be the repo root — the Dockerfile COPYs package.json,
+      # src, and build.mjs from there. ../.. walks up from deploy/coolify to the
+      # repo root, which is the value that deploys successfully on Coolify.
+      # (If a build ever can't find package.json, your Coolify Base Directory is
+      # the repo root "/" rather than the bundle folder — then use context: .)
+      context: ../..
+      dockerfile: docker/remote-agent/Dockerfile
+    restart: unless-stopped
+    environment:
+      # Bearer secret Mission Control uses to connect. Coolify auto-generates a
+      # 64-char value on first deploy and shows it under Environment Variables —
+      # copy it into Mission Control. Set MC_AGENT_API_KEY yourself in the UI
+      # before the first deploy to pin your own.
+      - MC_AGENT_API_KEY=${SERVICE_PASSWORD_64_AGENT}
+
+      # Single-volume layout: clones live under /home/workspace/workspace and
+      # /workspace is symlinked there, so SSH keys, CLI auth, and repos share the
+      # one persistent volume below.
+      - MC_LINK_WORKSPACE_TO_HOME=1
+
+      # NOTE: no SERVICE_FQDN_* magic var here on purpose — that is what would tell
+      # Coolify to allocate a public domain + Traefik route. We stay private.
+
+    ports:
+      # Publish ONLY on the host loopback. Nothing is reachable from the public
+      # internet or other host interfaces. `tailscale serve` (run on the Coolify
+      # host, see README) proxies this to your tailnet over HTTPS/wss.
+      #
+      # 9333 is the agent's default port; it won't collide with Checkmate's port.
+      # The tailnet-facing port is chosen in `tailscale serve` (use 8443, NOT 443,
+      # since Checkmate already owns 443 on this host).
+      - "127.0.0.1:9333:9333"
+
+    volumes:
+      # The container HOME. Persists ~/.ssh, ~/.claude, ~/.codex, ~/.cursor, and
+      # git clones across redeploys. docker-entrypoint.sh chowns this mount to the
+      # unprivileged `workspace` user on every boot, so a fresh named volume works.
+      - mc-agent-home:/home/workspace
+
+    healthcheck:
+      # Runs inside the container, independent of the host loopback publish.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9333/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      # Cold first boot installs/links the agent runtime; give it room.
+      start_period: 120s
+
+volumes:
+  mc-agent-home:

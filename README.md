@@ -52,6 +52,22 @@ Quick version:
 
 Without a volume, SSH keys and agent CLI login state are lost on every redeploy.
 
+## Coolify (private, via Tailscale)
+
+Use the **[Coolify deploy bundle](./deploy/coolify/README.md)** to run the agent on a
+[Coolify](https://coolify.io) server with a persistent volume and **no public domain** —
+exposed over your tailnet with `tailscale serve`.
+
+Quick version:
+
+1. **+ New** → **Public Repository** → this repo → **Build Pack: Docker Compose**.
+2. **Compose Location** → `/deploy/coolify/docker-compose.yaml`. Deploy.
+3. Copy the auto-generated `MC_AGENT_API_KEY` from **Environment Variables**; confirm the
+   `mc-agent-home` volume is at **`/home/workspace`**.
+4. On the host: `tailscale serve --bg --https=8443 127.0.0.1:9333` (use `8443`, not `443` —
+   Checkmate already owns 443).
+5. In Mission Control, create a **Remote VM** sandbox with `wss://<host>.<tailnet>.ts.net:8443`.
+
 ## Local Mission Control Docker Image
 
 Mission Control's private desktop app builds its local sandbox image from this package's Dockerfile:
